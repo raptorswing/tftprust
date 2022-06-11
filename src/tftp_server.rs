@@ -27,7 +27,7 @@ type TFTPBuffer = [u8; MAX_DATA_PACKET_SIZE];
 
 #[derive(PartialEq)]
 enum TFTPMode {
-    ASCII,
+    Ascii,
     Octet,
 }
 
@@ -60,8 +60,8 @@ impl TryFrom<(TFTPBuffer, usize)> for TFTPPacket {
             1 => {
                 // There should only be two null bytes total
                 {
-                    let num_nulls: Vec<_> = data[2..length].iter().filter(|&b| *b == 0).collect();
-                    if num_nulls.len() != 2 {
+                    let num_nulls = data[2..length].iter().filter(|&b| *b == 0).count();
+                    if num_nulls != 2 {
                         return Err(anyhow!("Unexpected number of nulls"));
                     }
                 }
@@ -109,7 +109,7 @@ impl TryFrom<(TFTPBuffer, usize)> for TFTPPacket {
                     "netascii" => {
                         return Ok(TFTPPacket::ReadRequest(
                             filename.to_string(),
-                            TFTPMode::ASCII,
+                            TFTPMode::Ascii,
                         ));
                     }
                     _ => {
@@ -170,7 +170,7 @@ impl std::fmt::Debug for TFTPPacket {
 impl std::fmt::Debug for TFTPMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TFTPMode::ASCII => write!(f, "NetASCII"),
+            TFTPMode::Ascii => write!(f, "NetASCII"),
             TFTPMode::Octet => write!(f, "octet"),
         }
     }
@@ -213,7 +213,7 @@ impl TFTPServer {
         }
     }
 
-    async fn spawn_wrap<Fut>(future: Fut) -> ()
+    async fn spawn_wrap<Fut>(future: Fut)
     where
         Fut: Future<Output = anyhow::Result<()>>,
     {
