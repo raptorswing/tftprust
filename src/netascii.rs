@@ -16,8 +16,7 @@ pub fn encode<T: AsRef<[u8]>>(input: T) -> Result<String, TFTPError> {
 
     // Encode newlines.
     let encoded_bytes = encode_newlines(input);
-    let s = String::from_utf8(encoded_bytes).map_err(|e| TFTPError::NetASCIIError(e.into()))?;
-    Ok(s)
+    String::from_utf8(encoded_bytes).map_err(|e| TFTPError::NetASCIIError(e.into()))
 }
 
 pub fn decode<T: AsRef<[u8]>>(input: T) -> Result<String, TFTPError> {
@@ -32,6 +31,139 @@ pub fn decode<T: AsRef<[u8]>>(input: T) -> Result<String, TFTPError> {
     let decoded_bytes = decode_newlines(input);
     let s = String::from_utf8(decoded_bytes).map_err(|e| TFTPError::NetASCIIError(e.into()))?;
     Ok(s)
+}
+
+pub struct NetASCIIEncode<I>
+where
+    I: Iterator<Item = u8>,
+{
+    iter: I,
+    last_was_cr: bool,
+    pending_nl: bool,
+}
+
+impl<I> Iterator for NetASCIIEncode<I>
+where
+    I: Iterator<Item = u8>,
+    I::Item: Copy,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pending_nl {
+            self.pending_nl = false;
+            return Some(NL);
+        }
+
+        match self.iter.next() {
+            None => None,
+            Some(v) => match v {
+                CR => {
+                    self.last_was_cr = true;
+                    Some(v)
+                }
+                NL => {
+                    if !self.last_was_cr {
+                        self.last_was_cr = false;
+                        self.pending_nl = true;
+                        Some(CR)
+                    } else {
+                        Some(NL)
+                    }
+                }
+                _ => {
+                    self.last_was_cr = false;
+                    Some(v)
+                }
+            },
+        }
+    }
+}
+
+impl<I> NetASCIIEncode<I>
+where
+    I: Iterator<Item = u8>,
+{
+    fn new(iter: I) -> Self {
+        NetASCIIEncode {
+            iter,
+            last_was_cr: false,
+            pending_nl: false,
+        }
+    }
+}
+
+pub trait NetASCIIEncodeAdapter
+where
+    Self: Sized + Iterator<Item = u8>,
+{
+    fn netascii_encode(self) -> NetASCIIEncode<Self>;
+}
+
+impl<I> NetASCIIEncodeAdapter for I
+where
+    I: Iterator<Item = u8>,
+{
+    fn netascii_encode(self) -> NetASCIIEncode<Self> {
+        NetASCIIEncode::new(self)
+    }
+}
+
+pub struct NetASCIIDecode<I>
+where
+    I: Iterator<Item = u8>,
+{
+    iter: std::iter::Peekable<I>,
+}
+
+impl<I> Iterator for NetASCIIDecode<I>
+where
+    I: Iterator<Item = u8>,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            None => None,
+            Some(cur) => match cur {
+                CR => match self.iter.peek() {
+                    Some(next) if *next == NL => {
+                        self.iter.next();
+                        Some(NL)
+                    }
+                    _ => Some(cur),
+                },
+                _ => Some(cur),
+            },
+        }
+    }
+}
+
+impl<I> NetASCIIDecode<I>
+where
+    I: Iterator<Item = u8>,
+{
+    fn new(iter: I) -> Self {
+        NetASCIIDecode {
+            iter: iter.peekable(),
+        }
+    }
+}
+
+pub trait NetASCIIDecodeAdapter
+where
+    Self: Sized + Iterator<Item = u8>,
+{
+    fn netascii_decode(self) -> NetASCIIDecode<Self>;
+}
+
+impl<I> NetASCIIDecodeAdapter for I
+where
+    I: Iterator<Item = u8>,
+{
+    fn netascii_decode(self) -> NetASCIIDecode<Self> {
+        NetASCIIDecode::new(self)
+    }
 }
 
 /// Returns true if all the bytes are valid "netascii" characters.
@@ -55,19 +187,7 @@ fn verify_bytes<T: AsRef<[u8]>>(input: T) -> bool {
 
 /// Prefixes all "\n" with "\r", unless they're already prefixed with "\r". So "\n" becomes "\r\n".
 fn encode_newlines<T: AsRef<[u8]>>(input: T) -> Vec<u8> {
-    let mut result = vec![];
-    let input_ref = input.as_ref();
-
-    let mut first = true;
-    for i in 0..input_ref.len() {
-        if (first || input_ref[i - 1] != CR) && input_ref[i] == NL {
-            result.push(CR)
-        }
-        first = false;
-        result.push(input_ref[i]);
-    }
-
-    result
+    input.as_ref().iter().copied().netascii_encode().collect()
 }
 
 /// Replaces "\r\n" with "\n" unless you're on a system that likes "\r\n" (windows).
@@ -84,21 +204,8 @@ fn decode_newlines<T: AsRef<[u8]>>(input: T) -> Vec<u8> {
 
 #[cfg(any(not(target_os = "windows"), test))]
 fn decode_newlines_real<T: AsRef<[u8]>>(input: T) -> Vec<u8> {
-    let mut result = Vec::with_capacity(input.as_ref().len());
 
-    let input_ref = input.as_ref();
-
-    let mut i = 0;
-    while i < input_ref.len() {
-        result.push(input_ref[i]);
-        if i + 1 < input_ref.len() && input_ref[i] == CR && input_ref[i + 1] == NL {
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-
-    result
+    input.as_ref().iter().copied().netascii_decode().collect()
 }
 
 #[cfg(test)]
@@ -171,6 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_newlines_many_nl_sandwich() {
+        // 'AHOY\r\n\r\n\r\n\r\n\r\nTHERE'
+        let input: Vec<u8> = vec![
+            65, 72, 79, 89, CR, NL, CR, NL, CR, NL, CR, NL, CR, NL, 84, 72, 69, 82, 69,
+        ];
+
+        // 'AHOY\n\n\n\n\nTHERE'
+        let want: Vec<u8> = vec![65, 72, 79, 89, NL, NL, NL, NL, NL, 84, 72, 69, 82, 69];
+        assert_eq!(decode_newlines_real(input), want);
+    }
+
+    #[test]
     fn test_decode_newlines_real_empty() {
         let input: Vec<u8> = vec![];
         let want: Vec<u8> = vec![];
@@ -201,21 +320,21 @@ mod tests {
     #[test]
     fn test_decode_newlines_real_two_replace() {
         let input: Vec<u8> = vec![CR, NL];
-        let want: Vec<u8> = vec![CR];
+        let want: Vec<u8> = vec![NL];
         assert_eq!(decode_newlines_real(input), want);
     }
 
     #[test]
     fn test_decode_newlines_real_three_replace() {
         let input: Vec<u8> = vec![CR, NL, CR];
-        let want: Vec<u8> = vec![CR, CR];
+        let want: Vec<u8> = vec![NL, CR];
         assert_eq!(decode_newlines_real(input), want);
     }
 
     #[test]
     fn test_decode_newlines_real_sneaky() {
         let input: Vec<u8> = vec![CR, CR, NL, NL];
-        let want: Vec<u8> = vec![CR, CR, NL];
+        let want: Vec<u8> = vec![CR, NL, NL];
         assert_eq!(decode_newlines_real(input), want);
     }
 
@@ -224,7 +343,7 @@ mod tests {
         let input: Vec<u8> = vec![
             65, 72, 79, 89, CR, NL, CR, NL, CR, NL, CR, NL, CR, NL, 84, 72, 69, 82, 69,
         ];
-        let want: Vec<u8> = vec![65, 72, 79, 89, CR, CR, CR, CR, CR, 84, 72, 69, 82, 69];
+        let want: Vec<u8> = vec![65, 72, 79, 89, NL, NL, NL, NL, NL, 84, 72, 69, 82, 69];
         assert_eq!(decode_newlines_real(input), want);
     }
 
