@@ -1,18 +1,14 @@
+use crate::errors::TFTPError;
 use crate::packets::{TFTPMode, TFTPPacket, MAX_DATA_PACKET_SIZE, MAX_DATA_SIZE};
-use anyhow::anyhow;
-use async_std::fs::File;
-use async_std::future::timeout;
-use async_std::net::Ipv4Addr;
-use async_std::net::SocketAddr;
-use async_std::net::ToSocketAddrs;
-use async_std::net::UdpSocket;
-use async_std::prelude::*;
-use futures::executor::block_on;
-use futures::executor::ThreadPool;
 use std::convert::TryFrom;
 use std::convert::TryInto;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::string;
 use std::time::{Duration, Instant};
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
+use tokio::net::UdpSocket;
+use tokio::time::timeout;
 
 const MAX_ACK_TIMEOUT_SECS: u64 = 10;
 
@@ -29,68 +25,66 @@ type TFTPBuffer = [u8; MAX_DATA_PACKET_SIZE];
 
 pub struct TFTPServer {
     socket: UdpSocket,
-    buf: TFTPBuffer,
+    listen_addr: SocketAddr,
 }
 
 impl TFTPServer {
-    pub fn run(&mut self) -> anyhow::Result<()> {
-        let pool = ThreadPool::new()?;
+    pub fn new<T>(listen_addr: T) -> Result<TFTPServer, TFTPError>
+    where
+        T: ToSocketAddrs,
+    {
+        match listen_addr.to_socket_addrs()?.next() {
+            Some(listen_addr) => {
+                let std_socket = std::net::UdpSocket::bind(listen_addr)?;
+                std_socket.set_nonblocking(true)?;
+                let socket = UdpSocket::from_std(std_socket)?;
+                Ok(TFTPServer {
+                    socket,
+                    listen_addr,
+                })
+            }
+            None => Err(TFTPError::GeneralError(anyhow::anyhow!(
+                "Failed to extract listen_addr"
+            ))),
+        }
+    }
+
+    pub async fn run(&self) -> Result<(), TFTPError> {
+        let mut buf = [0; MAX_DATA_PACKET_SIZE];
 
         loop {
-            match self.main_loop_iter(&pool) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Error processing incoming request: {}", e);
+            let (num_recv_bytes, sender) = self.socket.recv_from(&mut buf).await?;
+            let data = buf[0..num_recv_bytes].to_vec();
+
+            let packet = TFTPPacket::try_from(data)?;
+
+            match packet {
+                TFTPPacket::ReadRequest(filename, mode) => {
+                    let bind_addr = SocketAddr::new(self.listen_addr.ip(), 0);
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            TFTPServer::handle_read_request(bind_addr, sender, filename, mode).await
+                        {
+                            eprintln!("Error handling read request: {}", e);
+                        }
+                    });
+                }
+                _ => {
+                    eprintln!("Received unsupported packet {:?}", packet);
                 }
             }
         }
     }
 
-    //
-    fn main_loop_iter(&mut self, pool: &ThreadPool) -> anyhow::Result<()> {
-        let (num_recv_bytes, sender) = block_on(self.socket.recv_from(&mut self.buf))?;
-        let data = self.buf[0..num_recv_bytes].to_vec();
-        // println!("Received {} bytes from {:?}: {:?}", num_recv_bytes, sender, &self.buf[..num_recv_bytes]);
-
-        // Parse bytes into packet
-        let packet = TFTPPacket::try_from(data)?;
-
-        eprintln!("Received {:?} from {:?}", packet, sender);
-
-        // Take action based on packet
-        match packet {
-            TFTPPacket::ReadRequest(filename, mode) => {
-                pool.spawn_ok(TFTPServer::spawn_wrap(TFTPServer::handle_read_request(
-                    sender, filename, mode,
-                )));
-                Ok(())
-            }
-
-            _ => Err(anyhow!("Unsupported operation")),
-        }
-    }
-
-    async fn spawn_wrap<Fut>(future: Fut)
-    where
-        Fut: Future<Output = anyhow::Result<()>>,
-    {
-        match future.await {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error during request processing: {}", e);
-            }
-        }
-    }
-
     async fn handle_read_request(
+        bind_addr: SocketAddr,
         remote: SocketAddr,
         filename: string::String,
         _mode: TFTPMode,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TFTPError> {
         eprintln!("Time to handle a read request");
 
-        let broadcast_addr = (Ipv4Addr::new(0, 0, 0, 0), 0);
-        let client_socket = UdpSocket::bind(broadcast_addr).await?;
+        let client_socket = UdpSocket::bind(bind_addr).await?;
         client_socket.connect(remote).await?;
 
         let mut file = File::open(filename).await?;
@@ -126,7 +120,7 @@ impl TFTPServer {
         client_socket: &UdpSocket,
         expected_block: u16,
         data_packet: &[u8],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), TFTPError> {
         let mut to_recv: TFTPBuffer = [0; MAX_DATA_PACKET_SIZE];
 
         let now = Instant::now();
@@ -138,28 +132,32 @@ impl TFTPServer {
             )
             .await;
 
-            if r.is_err() {
-                if now.elapsed().as_secs() >= MAX_ACK_TIMEOUT_SECS {
-                    return Err(anyhow!("Timed out waiting for ACK"));
+            let num_read = match r {
+                Err(e) => {
+                    if now.elapsed().as_secs() >= MAX_ACK_TIMEOUT_SECS {
+                        return Err(TFTPError::GeneralError(e.into()));
+                    }
+                    let num_written = client_socket.send(data_packet).await?;
+                    eprintln!("(Retry) Wrote {} bytes to socket", num_written);
+                    continue;
                 }
+                Ok(recv_result) => match recv_result {
+                    Err(e) => {
+                        return Err(TFTPError::IOError(e));
+                    }
+                    Ok(num_read) => num_read,
+                },
+            };
 
-                let num_written = client_socket.send(data_packet).await?;
-                eprintln!("(Retry) Wrote {} bytes to socket", num_written);
-                continue;
-            }
-
-            let recv_result = r.unwrap();
-            let num_read_socket = recv_result?;
-
-            let data = to_recv[0..num_read_socket].to_vec();
+            let data = to_recv[0..num_read].to_vec();
 
             let packet = TFTPPacket::try_from(data);
-            if packet.is_err() {
+            if let Err(e) = packet {
                 eprintln!(
                     "Received {} unparsable bytes: {:?}. Error: {}",
-                    num_read_socket,
-                    &to_recv[..num_read_socket],
-                    packet.unwrap_err()
+                    num_read,
+                    &to_recv[..num_read],
+                    e
                 );
                 continue;
             }
@@ -182,12 +180,5 @@ impl TFTPServer {
                 }
             }
         }
-    }
-}
-
-pub fn make_tftp_server<A: ToSocketAddrs>(addr: A) -> TFTPServer {
-    TFTPServer {
-        socket: block_on(UdpSocket::bind(addr)).unwrap(),
-        buf: [0; MAX_DATA_PACKET_SIZE],
     }
 }

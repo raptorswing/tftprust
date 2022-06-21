@@ -12,5 +12,8 @@ pub enum TFTPError {
     MalformedPacket(String),
 
     #[error("General error: {0}")]
-    GeneralError(#[source] anyhow::Error)
+    GeneralError(#[source] anyhow::Error),
+
+    #[error("I/O error: {0}")]
+    IOError(#[from] std::io::Error),
 }

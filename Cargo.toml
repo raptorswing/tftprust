@@ -6,6 +6,8 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0.57"
-async-std = "1.11.0"
-futures = { version = "0.3", default-features = true, features = ["thread-pool"] }
 thiserror = "1.0.31"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "time", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "time", "fs", "macros"] }
