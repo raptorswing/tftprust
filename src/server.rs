@@ -1,8 +1,11 @@
 use crate::errors::TFTPError;
 use crate::packets::{TFTPMode, TFTPPacket, MAX_DATA_PACKET_SIZE, MAX_DATA_SIZE};
+use bytes::Bytes;
+use futures_core::stream::Stream;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::pin::Pin;
 use std::string;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
@@ -87,15 +90,22 @@ impl TFTPServer {
         let client_socket = UdpSocket::bind(bind_addr).await?;
         client_socket.connect(remote).await?;
 
-        let mut file = File::open(filename).await?;
+        let file = File::open(filename).await?;
+
+        let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            Box::pin(tokio_util::io::ReaderStream::new(file));
+
+        if _mode == TFTPMode::Ascii {
+            stream = Box::pin(crate::netascii::netascii_encode_stream(stream));
+        }
+
+        let mut reader = tokio_util::io::StreamReader::new(stream);
 
         let mut block_count: u16 = 1;
         loop {
             let mut read_buf = vec![0; MAX_DATA_SIZE];
-            let num_read_from_file = file.read(&mut read_buf).await?;
+            let num_read_from_file = reader.read(&mut read_buf).await?;
             read_buf.truncate(num_read_from_file);
-
-            // TODO We have to convert our data if we're doing netascii mode!
 
             let data_packet = TFTPPacket::Data(block_count, read_buf);
             block_count += 1;
