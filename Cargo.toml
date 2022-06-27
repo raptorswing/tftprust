@@ -3,9 +3,22 @@ name = "tftprust"
 version = "0.1.0"
 authors = ["raptorswing"]
 edition = "2018"
+license = "MIT"
+description = "A toy TFTP server"
+categories = ["network-programming"]
+repository = "https://github.com/raptorswing/tftprust"
+keywords = ["tftp"]
 
 [dependencies]
 anyhow = "1.0.57"
-ascii = "1.0.0"
-async-std = "1.11.0"
-futures = { version = "0.3", default-features = true, features = ["thread-pool"] }
+async-stream = "0.3.3"
+bytes = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+thiserror = "1.0.31"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "time", "fs"] }
+tokio-stream = "0.1.9"
+tokio-util = { version = "0.7.3", features = ["io", "codec"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "time", "fs", "macros"] }
