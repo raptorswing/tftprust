@@ -16,4 +16,7 @@ pub enum TFTPError {
 
     #[error("I/O error: {0}")]
     IOError(#[from] std::io::Error),
+
+    #[error("Operation timed out: {0}")]
+    TimeoutError(String),
 }

@@ -60,7 +60,7 @@ impl TryFrom<Vec<u8>> for TFTPPacket {
             OPCODE_DATA => {
                 // Extract the block number.
                 let block_bytes =
-                    data[..2]
+                    data[2..4]
                         .try_into()
                         .map_err(|e: std::array::TryFromSliceError| {
                             TFTPError::GeneralError(e.into())

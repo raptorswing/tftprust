@@ -204,6 +204,51 @@ pub fn netascii_encode_stream<S: Stream<Item = Result<Bytes, std::io::Error>>>(
     }
 }
 
+pub fn netascii_decode_stream<S: Stream<Item = Result<Bytes, std::io::Error>>>(
+    input: S,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+    stream! {
+        let mut pending_cr = false;
+        for await chunk in input {
+            match chunk {
+                Err(e) => {
+                    yield Err(e);
+                }
+                Ok(bytes) => {
+                    let mut output = Vec::with_capacity(bytes.len());
+                    for value in bytes {
+                        match value {
+                            CR if pending_cr => {
+                                output.push(CR);
+                            }
+                            CR if !pending_cr => {
+                                pending_cr = true;
+                            }
+                            NL if pending_cr => {
+                                output.push(NL);
+                                pending_cr = false;
+                            }
+                            _ if pending_cr => {
+                                output.push(CR);
+                                output.push(value);
+                                pending_cr = false;
+                            }
+                            _ => {
+                                output.push(value);
+                            }
+                        }
+                    }
+                    yield Ok(Bytes::from(output));
+                }
+            }
+        }
+
+        if pending_cr {
+            yield Ok(Bytes::from_static(b"\r"));
+        }
+    }
+}
+
 /// Returns true if all the bytes are valid "netascii" characters.
 fn verify_bytes<T: AsRef<[u8]>>(input: T) -> bool {
     for x in input.as_ref() {
@@ -537,6 +582,196 @@ mod tests {
             65, 72, 79, 89, CR, NL, CR, NL, CR, NL, CR, NL, CR, NL, 84, 72, 69, 82, 69,
         ];
         let s = netascii_encode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_many_nl_sandwich() {
+        // 'AHOY\r\n\r\n\r\n\r\n\r\nTHERE'
+        let input = try_stream! {
+            for x in vec![
+                65, 72, 79, 89, CR, NL, CR, NL, CR, NL, CR, NL, CR, NL, 84, 72, 69, 82, 69,
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+
+        // 'AHOY\n\n\n\n\nTHERE'
+        let want: Vec<u8> = vec![65, 72, 79, 89, NL, NL, NL, NL, NL, 84, 72, 69, 82, 69];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_empty() {
+        let input = try_stream! {
+            for x in vec![] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_one() {
+        let input = try_stream! {
+            for x in vec![
+                5
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![5];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_two() {
+        let input = try_stream! {
+            for x in vec![
+                5,6
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![5, 6];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_three() {
+        let input = try_stream! {
+            for x in vec![
+               5,6,7
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![5, 6, 7];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_two_replace() {
+        let input = try_stream! {
+            for x in vec![
+                CR, NL
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![NL];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_three_replace() {
+        let input = try_stream! {
+            for x in vec![
+                CR, NL, CR
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![NL, CR];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_sneaky() {
+        let input = try_stream! {
+            for x in vec![
+                CR, CR, NL, NL
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![CR, NL, NL];
+        let s = netascii_decode_stream(input);
+        pin_mut!(s);
+        let mut got = vec![];
+        while let Some(bytes) = s.next().await {
+            for x in bytes.unwrap() {
+                got.push(x);
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn test_netascii_decode_stream_sandwich() {
+        let input = try_stream! {
+            for x in vec![
+                65, 72, 79, 89, CR, NL, CR, NL, CR, NL, CR, NL, CR, NL, 84, 72, 69, 82, 69,
+            ] {
+                yield Bytes::from(vec![x]);
+            }
+        };
+        let want: Vec<u8> = vec![65, 72, 79, 89, NL, NL, NL, NL, NL, 84, 72, 69, 82, 69];
+        let s = netascii_decode_stream(input);
         pin_mut!(s);
         let mut got = vec![];
         while let Some(bytes) = s.next().await {

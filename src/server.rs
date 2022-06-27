@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::string;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -61,14 +61,25 @@ impl TFTPServer {
 
             let packet = TFTPPacket::try_from(data)?;
 
+            let bind_addr = SocketAddr::new(self.listen_addr.ip(), 0);
+
             match packet {
                 TFTPPacket::ReadRequest(filename, mode) => {
-                    let bind_addr = SocketAddr::new(self.listen_addr.ip(), 0);
                     tokio::spawn(async move {
                         if let Err(e) =
                             TFTPServer::handle_read_request(bind_addr, sender, filename, mode).await
                         {
                             eprintln!("Error handling read request: {}", e);
+                        }
+                    });
+                }
+                TFTPPacket::WriteRequest(filename, mode) => {
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            TFTPServer::handle_write_request(bind_addr, sender, filename, mode)
+                                .await
+                        {
+                            eprintln!("Error handling write request: {}", e);
                         }
                     });
                 }
@@ -83,19 +94,19 @@ impl TFTPServer {
         bind_addr: SocketAddr,
         remote: SocketAddr,
         filename: string::String,
-        _mode: TFTPMode,
+        mode: TFTPMode,
     ) -> Result<(), TFTPError> {
         eprintln!("Time to handle a read request");
 
-        let client_socket = UdpSocket::bind(bind_addr).await?;
-        client_socket.connect(remote).await?;
+        let socket = UdpSocket::bind(bind_addr).await?;
+        socket.connect(remote).await?;
 
         let file = File::open(filename).await?;
 
         let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
             Box::pin(tokio_util::io::ReaderStream::new(file));
 
-        if _mode == TFTPMode::Ascii {
+        if mode == TFTPMode::Ascii {
             stream = Box::pin(crate::netascii::netascii_encode_stream(stream));
         }
 
@@ -103,6 +114,7 @@ impl TFTPServer {
 
         let mut block_count: u16 = 1;
         loop {
+            // TODO optimize to minimize allocations.
             let mut read_buf = vec![0; MAX_DATA_SIZE];
             let num_read_from_file = reader.read(&mut read_buf).await?;
             read_buf.truncate(num_read_from_file);
@@ -112,10 +124,10 @@ impl TFTPServer {
 
             // Write the data to our buddy
             let data_packet_bytes: Vec<u8> = data_packet.try_into()?;
-            client_socket.send(&data_packet_bytes).await?;
+            socket.send(&data_packet_bytes).await?;
 
             // Wait for ack, retransmitting as necessary
-            TFTPServer::wait_for_ack(&client_socket, block_count - 1, &data_packet_bytes).await?;
+            TFTPServer::wait_for_ack(&socket, block_count - 1, &data_packet_bytes).await?;
 
             // If we've reached EOF, stop
             if num_read_from_file < MAX_DATA_SIZE {
@@ -126,8 +138,69 @@ impl TFTPServer {
         Ok(())
     }
 
+    async fn handle_write_request(
+        bind_addr: SocketAddr,
+        remote: SocketAddr,
+        filename: String,
+        _mode: TFTPMode, // TODO implement decode from netascii.
+    ) -> Result<(), TFTPError> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        let bound_addr = socket.local_addr()?;
+        socket.connect(remote).await?;
+
+        eprintln!("Receiving file {} on {}", filename, bound_addr);
+        let mut file = File::create(filename).await?;
+
+        // Send initial ACK to get the ball rolling.
+        TFTPServer::send_ack(&socket, 0).await?;
+
+        let mut expected_block: u16 = 1;
+
+        loop {
+            let mut read_buf = vec![0; MAX_DATA_PACKET_SIZE];
+
+            let r = timeout(Duration::from_millis(3000), socket.recv(&mut read_buf)).await;
+            let num_read = match r {
+                Err(_) => {
+                    return Err(TFTPError::TimeoutError("waiting for data".to_string()));
+                }
+                Ok(recv_result) => match recv_result {
+                    Err(e) => {
+                        return Err(TFTPError::IOError(e));
+                    }
+                    Ok(num_read) => num_read,
+                },
+            };
+            read_buf.truncate(num_read);
+
+            let packet: TFTPPacket = read_buf.try_into()?;
+            if let TFTPPacket::Data(block, data) = packet {
+                if block != expected_block {
+                    eprintln!("Got block {} but expected block {}", block, expected_block);
+                    continue;
+                }
+
+                // Write data to file.
+                // This is not cancellation-safe - see https://docs.rs/tokio/latest/tokio/io/trait.AsyncWriteExt.html#method.write_all.
+                file.write_all(&data).await?;
+
+                // Send ACK.
+                TFTPServer::send_ack(&socket, block).await?;
+                expected_block += 1;
+
+                // We're done when the sender gives us less than MAX_DATA_SIZE bytes of data in a datagram.
+                if data.len() < MAX_DATA_SIZE {
+                    eprintln!("Finished receiving on {}", bound_addr);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn wait_for_ack(
-        client_socket: &UdpSocket,
+        socket: &UdpSocket,
         expected_block: u16,
         data_packet: &[u8],
     ) -> Result<(), TFTPError> {
@@ -136,18 +209,14 @@ impl TFTPServer {
         let now = Instant::now();
 
         loop {
-            let r = timeout(
-                Duration::from_millis(3000),
-                client_socket.recv(&mut to_recv),
-            )
-            .await;
+            let r = timeout(Duration::from_millis(3000), socket.recv(&mut to_recv)).await;
 
             let num_read = match r {
-                Err(e) => {
+                Err(_) => {
                     if now.elapsed().as_secs() >= MAX_ACK_TIMEOUT_SECS {
-                        return Err(TFTPError::GeneralError(e.into()));
+                        return Err(TFTPError::TimeoutError("waiting for ACK".to_string()));
                     }
-                    let num_written = client_socket.send(data_packet).await?;
+                    let num_written = socket.send(data_packet).await?;
                     eprintln!("(Retry) Wrote {} bytes to socket", num_written);
                     continue;
                 }
@@ -190,5 +259,18 @@ impl TFTPServer {
                 }
             }
         }
+    }
+
+    async fn send_ack(socket: &UdpSocket, block: u16) -> Result<(), TFTPError> {
+        let ack_bytes: Vec<u8> = TFTPPacket::Ack(block).try_into()?;
+        let num_sent = socket.send(&ack_bytes).await?;
+        if num_sent != ack_bytes.len() {
+            return Err(TFTPError::GeneralError(anyhow::anyhow!(format!(
+                "Expected to send {} bytes but only sent {}",
+                ack_bytes.len(),
+                num_sent
+            ))));
+        }
+        Ok(())
     }
 }
