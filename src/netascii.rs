@@ -276,7 +276,7 @@ fn encode_newlines<T: AsRef<[u8]>>(input: T) -> Vec<u8> {
 /// Replaces "\r\n" with "\n" unless you're on a system that likes "\r\n" (windows).
 #[cfg(not(target_os = "windows"))]
 fn decode_newlines<T: AsRef<[u8]>>(input: T) -> Vec<u8> {
-    decode_newlines_real(input: T)
+    decode_newlines_real(T)
 }
 
 /// Replaces "\r\n" with "\n" unless you're on a system that likes "\r\n" (windows).
